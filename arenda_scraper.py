@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Arenda.az Real Estate Scraper
-Robust scraper with crash recovery and data persistence
+Arenda.az Real Estate Scraper - Complete Solution
+Robust scraper with crash recovery, retry logic, and statistics
+Usage:
+    python arenda_scraper.py scrape          # Start scraping
+    python arenda_scraper.py retry           # Retry failed listings
+    python arenda_scraper.py stats           # View statistics
 """
 
 import asyncio
@@ -12,14 +16,13 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from datetime import datetime
 import re
-from urllib.parse import urljoin, urlparse
 import signal
 import sys
 from dataclasses import dataclass, asdict
-import time
+from collections import Counter
 
 # Configure logging
 logging.basicConfig(
@@ -49,7 +52,7 @@ class Listing:
     floor: str = ""
     total_floors: str = ""
     description: str = ""
-    features: str = ""  # Comma-separated features
+    features: str = ""
     agent_name: str = ""
     phone: str = ""
     date_posted: str = ""
@@ -70,7 +73,6 @@ class ScraperState:
         self.state = self._load_state()
 
     def _load_state(self) -> Dict:
-        """Load state from file"""
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
@@ -81,7 +83,6 @@ class ScraperState:
         return self._initial_state()
 
     def _initial_state(self) -> Dict:
-        """Create initial state"""
         return {
             'last_page': 0,
             'processed_listings': [],
@@ -91,7 +92,6 @@ class ScraperState:
         }
 
     def save(self):
-        """Save state to file"""
         try:
             self.state['last_update'] = datetime.now().isoformat()
             with open(self.state_file, 'w', encoding='utf-8') as f:
@@ -100,30 +100,26 @@ class ScraperState:
             logger.error(f"Error saving state: {e}")
 
     def add_processed(self, listing_id: str):
-        """Mark listing as processed"""
         if listing_id not in self.state['processed_listings']:
             self.state['processed_listings'].append(listing_id)
             self.state['total_scraped'] += 1
             self.save()
 
     def add_failed(self, listing_id: str, url: str):
-        """Mark listing as failed"""
         failed_entry = {'id': listing_id, 'url': url, 'time': datetime.now().isoformat()}
         self.state['failed_listings'].append(failed_entry)
         self.save()
 
     def is_processed(self, listing_id: str) -> bool:
-        """Check if listing already processed"""
         return listing_id in self.state['processed_listings']
 
     def set_last_page(self, page: int):
-        """Update last processed page"""
         self.state['last_page'] = page
         self.save()
 
 
 class CSVWriter:
-    """Thread-safe CSV writer with buffering"""
+    """Thread-safe CSV writer"""
 
     def __init__(self, filename: str = "arenda_listings.csv"):
         self.filename = Path(filename)
@@ -131,7 +127,6 @@ class CSVWriter:
         self._initialize_file()
 
     def _initialize_file(self):
-        """Initialize CSV file with headers"""
         if not self.filename.exists():
             try:
                 with open(self.filename, 'w', newline='', encoding='utf-8-sig') as f:
@@ -141,11 +136,9 @@ class CSVWriter:
                 logger.error(f"Error initializing CSV: {e}")
 
     def _get_headers(self) -> List[str]:
-        """Get CSV headers"""
         return [field.name for field in Listing.__dataclass_fields__.values()]
 
     async def write_row(self, listing: Listing):
-        """Write a single row to CSV"""
         async with self.lock:
             try:
                 with open(self.filename, 'a', newline='', encoding='utf-8-sig') as f:
@@ -153,18 +146,6 @@ class CSVWriter:
                     writer.writerow(asdict(listing))
             except Exception as e:
                 logger.error(f"Error writing to CSV: {e}")
-                raise
-
-    async def write_rows(self, listings: List[Listing]):
-        """Write multiple rows to CSV"""
-        async with self.lock:
-            try:
-                with open(self.filename, 'a', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.DictWriter(f, fieldnames=self._get_headers())
-                    for listing in listings:
-                        writer.writerow(asdict(listing))
-            except Exception as e:
-                logger.error(f"Error writing rows to CSV: {e}")
                 raise
 
 
@@ -179,42 +160,38 @@ class ArendaScraper:
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[ClientSession] = None
         self.running = True
-
-        # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
         self.running = False
 
     async def _create_session(self) -> ClientSession:
-        """Create aiohttp session with optimal settings"""
         timeout = ClientTimeout(total=30, connect=10)
-        connector = TCPConnector(
-            limit=100,
-            limit_per_host=10,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True
-        )
+        connector = TCPConnector(limit=100, limit_per_host=10, ttl_dns_cache=300)
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'az,en-US;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
         }
         return ClientSession(timeout=timeout, connector=connector, headers=headers)
 
     async def _fetch_with_retry(self, url: str, max_retries: int = 3) -> Optional[str]:
-        """Fetch URL with retry logic"""
         for attempt in range(max_retries):
             try:
                 async with self.semaphore:
                     async with self.session.get(url) as response:
                         if response.status == 200:
-                            return await response.text()
+                            # Try different encodings
+                            try:
+                                return await response.text(encoding='utf-8')
+                            except:
+                                try:
+                                    return await response.text(encoding='windows-1254')
+                                except:
+                                    content = await response.read()
+                                    return content.decode('utf-8', errors='ignore')
                         elif response.status == 404:
                             logger.warning(f"Page not found: {url}")
                             return None
@@ -226,57 +203,45 @@ class ArendaScraper:
                 logger.error(f"Error fetching {url}: {e}, attempt {attempt + 1}/{max_retries}")
 
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-
+                await asyncio.sleep(2 ** attempt)
         return None
 
     def _extract_listing_links(self, html: str) -> List[tuple]:
-        """Extract listing links from page"""
         soup = BeautifulSoup(html, 'html.parser')
         listings = []
-
         for li in soup.find_all('li', class_='new_elan_box'):
             listing_id = li.get('id', '').replace('elan_', '')
             link = li.find('a', href=True)
-
             if link and listing_id:
-                url = urljoin(self.base_url, link['href'])
+                url = f"{self.base_url}{link['href']}" if link['href'].startswith('/') else link['href']
                 listings.append((listing_id, url))
-
         return listings
 
     def _clean_text(self, text: str) -> str:
-        """Clean and normalize text"""
         if not text:
             return ""
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
+        return re.sub(r'\s+', ' ', text).strip()
 
     def _extract_number(self, text: str) -> str:
-        """Extract number from text"""
         if not text:
             return ""
         match = re.search(r'[\d\s]+', text)
         return match.group().strip() if match else ""
 
     async def _parse_listing_detail(self, html: str, url: str) -> Optional[Listing]:
-        """Parse listing detail page"""
         try:
             soup = BeautifulSoup(html, 'html.parser')
             listing = Listing()
-
-            # Extract listing ID from URL
             listing.url = url
             listing.listing_id = url.split('-')[-1] if '-' in url else ""
             listing.scraped_at = datetime.now().isoformat()
 
-            # Property type and title
+            # Property type
             title_elem = soup.find('h2', class_='elan_in_title_link')
             if title_elem:
                 listing.property_type = self._clean_text(title_elem.get_text())
 
-            # Full title from elan_elan_nov
+            # Title
             full_title = soup.find('p', class_='elan_elan_nov')
             if full_title:
                 listing.title = self._clean_text(full_title.get_text())
@@ -288,7 +253,7 @@ class ArendaScraper:
                 listing.price = price_text
                 listing.price_azn = self._extract_number(price_text)
 
-            # Location/Address
+            # Location
             location_elem = soup.find('p', class_='elan_unvan')
             if location_elem:
                 listing.location = self._clean_text(location_elem.get_text())
@@ -297,7 +262,7 @@ class ArendaScraper:
             if address_elem:
                 listing.address = self._clean_text(address_elem.get_text())
 
-            # Properties (rooms, area, floor)
+            # Properties
             property_list = soup.find('ul', class_='elan_property_list')
             if property_list:
                 props = property_list.find_all('li')
@@ -326,7 +291,6 @@ class ArendaScraper:
             if property_lists:
                 features = property_lists.find_all('li')
                 for feature in features:
-                    # Extract text after SVG icon
                     feature_text = self._clean_text(feature.get_text())
                     if feature_text:
                         features_list.append(feature_text)
@@ -338,8 +302,6 @@ class ArendaScraper:
                 agent_name = agent_info.find('p')
                 if agent_name:
                     listing.agent_name = self._clean_text(agent_name.get_text())
-
-                # Phone number
                 phone_link = agent_info.find('a', class_='elan_in_tel')
                 if phone_link:
                     listing.phone = self._clean_text(phone_link.get_text())
@@ -357,13 +319,9 @@ class ArendaScraper:
                     elif 'Baxış sayı:' in text:
                         listing.view_count = text.replace('Baxış sayı:', '').strip()
 
-            # Document status
-            kupca_icon = soup.find('button', class_='kupca_ico')
-            listing.has_document = 'Bəli' if kupca_icon else 'Xeyr'
-
-            # Credit availability
-            credit_icon = soup.find('button', class_='kreditle_ico')
-            listing.is_credit_available = 'Bəli' if credit_icon else 'Xeyr'
+            # Document & Credit
+            listing.has_document = 'Bəli' if soup.find('button', class_='kupca_ico') else 'Xeyr'
+            listing.is_credit_available = 'Bəli' if soup.find('button', class_='kreditle_ico') else 'Xeyr'
 
             # Coordinates
             lat_input = soup.find('input', {'name': 'lat'})
@@ -374,94 +332,69 @@ class ArendaScraper:
                 listing.longitude = lon_input['value']
 
             return listing
-
         except Exception as e:
-            logger.error(f"Error parsing listing detail: {e}")
+            logger.error(f"Error parsing listing: {e}")
             return None
 
     async def _scrape_listing(self, listing_id: str, url: str) -> Optional[Listing]:
-        """Scrape a single listing"""
         if self.state.is_processed(listing_id):
-            logger.info(f"Skipping already processed listing: {listing_id}")
+            logger.info(f"Skipping already processed: {listing_id}")
             return None
 
         try:
-            logger.info(f"Scraping listing {listing_id}: {url}")
+            logger.info(f"Scraping {listing_id}: {url}")
             html = await self._fetch_with_retry(url)
-
             if not html:
-                logger.error(f"Failed to fetch listing {listing_id}")
                 self.state.add_failed(listing_id, url)
                 return None
 
             listing = await self._parse_listing_detail(html, url)
-
             if listing:
-                # Save to CSV immediately
                 await self.csv_writer.write_row(listing)
                 self.state.add_processed(listing_id)
-                logger.info(f"Successfully scraped listing {listing_id}")
+                logger.info(f"✓ Scraped {listing_id}")
                 return listing
             else:
-                logger.error(f"Failed to parse listing {listing_id}")
                 self.state.add_failed(listing_id, url)
                 return None
-
         except Exception as e:
-            logger.error(f"Error scraping listing {listing_id}: {e}")
+            logger.error(f"Error scraping {listing_id}: {e}")
             self.state.add_failed(listing_id, url)
             return None
 
     async def _scrape_page(self, page: int) -> List[Listing]:
-        """Scrape all listings from a page"""
         if not self.running:
             return []
 
-        # Construct page URL
         url = f"{self.base_url}/filtirli-axtaris/{page}/?home_search=1&lang=1&site=1&home_s=1"
-        logger.info(f"Scraping page {page}: {url}")
+        logger.info(f"Scraping page {page}")
 
         html = await self._fetch_with_retry(url)
         if not html:
-            logger.error(f"Failed to fetch page {page}")
             return []
 
-        # Extract listing links
         listing_links = self._extract_listing_links(html)
         logger.info(f"Found {len(listing_links)} listings on page {page}")
 
         if not listing_links:
-            logger.warning(f"No listings found on page {page}")
             return []
 
-        # Scrape all listings concurrently
-        tasks = [
-            self._scrape_listing(listing_id, listing_url)
-            for listing_id, listing_url in listing_links
-        ]
-
+        tasks = [self._scrape_listing(lid, lurl) for lid, lurl in listing_links]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Filter out None results and exceptions
         listings = [r for r in results if isinstance(r, Listing)]
 
         self.state.set_last_page(page)
-        logger.info(f"Completed page {page}: {len(listings)}/{len(listing_links)} successful")
-
+        logger.info(f"✓ Page {page}: {len(listings)}/{len(listing_links)} successful")
         return listings
 
     def _get_max_page(self, html: str) -> int:
-        """Extract maximum page number from pagination"""
         try:
             soup = BeautifulSoup(html, 'html.parser')
             pagination = soup.find('ul', class_='pagination')
             if pagination:
                 page_links = pagination.find_all('a', class_='page-numbers')
-                pages = []
-                for link in page_links:
-                    text = link.get_text().strip()
-                    if text.isdigit():
-                        pages.append(int(text))
+                pages = [int(link.get_text().strip()) for link in page_links
+                        if link.get_text().strip().isdigit()]
                 return max(pages) if pages else 1
         except Exception as e:
             logger.error(f"Error extracting max page: {e}")
@@ -472,12 +405,10 @@ class ArendaScraper:
         try:
             self.session = await self._create_session()
 
-            # Resume from last page if available
             if self.state.state['last_page'] > 0:
                 start_page = self.state.state['last_page']
                 logger.info(f"Resuming from page {start_page}")
 
-            # Determine end page if not specified
             if end_page is None:
                 first_page_html = await self._fetch_with_retry(
                     f"{self.base_url}/filtirli-axtaris/1/?home_search=1&lang=1&site=1&home_s=1"
@@ -486,58 +417,153 @@ class ArendaScraper:
                     end_page = self._get_max_page(first_page_html)
                     logger.info(f"Detected {end_page} total pages")
                 else:
-                    logger.error("Could not determine total pages, defaulting to 10")
                     end_page = 10
 
-            logger.info(f"Starting scrape from page {start_page} to {end_page}")
+            logger.info(f"Scraping pages {start_page} to {end_page}")
 
-            # Scrape pages
             for page in range(start_page, end_page + 1):
                 if not self.running:
-                    logger.info("Scraper stopped by user")
                     break
-
                 try:
                     await self._scrape_page(page)
-                    # Small delay between pages to be respectful
                     await asyncio.sleep(1)
                 except Exception as e:
-                    logger.error(f"Error scraping page {page}: {e}")
-                    continue
+                    logger.error(f"Error on page {page}: {e}")
 
-            logger.info(f"Scraping completed. Total listings: {self.state.state['total_scraped']}")
-            logger.info(f"Failed listings: {len(self.state.state['failed_listings'])}")
-
-        except Exception as e:
-            logger.error(f"Critical error in scraper: {e}")
+            logger.info(f"✓ Completed! Total: {self.state.state['total_scraped']}")
         finally:
             if self.session:
                 await self.session.close()
-            logger.info("Session closed")
 
 
-async def main():
-    """Main entry point"""
-    # Configuration
-    START_PAGE = 1
-    END_PAGE = None  # Set to None to scrape all pages, or specify a number
-    MAX_CONCURRENT = 5  # Number of concurrent requests
+async def retry_failed():
+    """Retry failed listings"""
+    state = ScraperState()
+    failed = state.state.get('failed_listings', [])
 
-    logger.info("=" * 80)
-    logger.info("Arenda.az Real Estate Scraper")
-    logger.info("=" * 80)
+    if not failed:
+        logger.info("No failed listings to retry")
+        return
 
-    scraper = ArendaScraper(max_concurrent=MAX_CONCURRENT)
+    logger.info(f"Retrying {len(failed)} failed listings")
+    scraper = ArendaScraper(max_concurrent=3)
+    scraper.session = await scraper._create_session()
 
+    success = 0
     try:
-        await scraper.scrape(start_page=START_PAGE, end_page=END_PAGE)
-    except KeyboardInterrupt:
-        logger.info("Scraper interrupted by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        for f in failed:
+            if f['id'] in state.state['processed_listings']:
+                state.state['processed_listings'].remove(f['id'])
+
+            result = await scraper._scrape_listing(f['id'], f['url'])
+            if result:
+                success += 1
+                state.state['failed_listings'] = [x for x in state.state['failed_listings']
+                                                  if x['id'] != f['id']]
+                state.save()
+            await asyncio.sleep(2)
     finally:
-        logger.info("Scraper finished")
+        if scraper.session:
+            await scraper.session.close()
+
+    logger.info(f"✓ Retry completed: {success}/{len(failed)} successful")
+
+
+def show_stats():
+    """Display statistics"""
+    state_file = Path("scraper_state.json")
+    csv_file = Path("arenda_listings.csv")
+
+    state = {}
+    if state_file.exists():
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+
+    data = []
+    if csv_file.exists():
+        with open(csv_file, 'r', encoding='utf-8-sig') as f:
+            data = list(csv.DictReader(f))
+
+    print("=" * 80)
+    print("ARENDA.AZ SCRAPER STATISTICS")
+    print("=" * 80)
+    print(f"\n📊 SCRAPER STATE")
+    print("-" * 80)
+    print(f"Last Page:          {state.get('last_page', 0)}")
+    print(f"Total Scraped:      {state.get('total_scraped', 0)}")
+    print(f"Failed:             {len(state.get('failed_listings', []))}")
+    print(f"CSV Rows:           {len(data)}")
+
+    if not data:
+        return
+
+    # Property types
+    prop_types = Counter(r['property_type'] for r in data if r['property_type'])
+    print(f"\n🏠 PROPERTY TYPES")
+    print("-" * 80)
+    for ptype, count in prop_types.most_common(5):
+        print(f"{ptype:30} {count:>6} ({count/len(data)*100:.1f}%)")
+
+    # Prices
+    prices = []
+    for r in data:
+        try:
+            if r['price_azn']:
+                p = float(r['price_azn'].replace(' ', ''))
+                if p > 0:
+                    prices.append(p)
+        except:
+            pass
+
+    if prices:
+        print(f"\n💰 PRICES (AZN)")
+        print("-" * 80)
+        print(f"Average:            {sum(prices)/len(prices):,.0f}")
+        print(f"Min:                {min(prices):,.0f}")
+        print(f"Max:                {max(prices):,.0f}")
+        print(f"Median:             {sorted(prices)[len(prices)//2]:,.0f}")
+
+    # Rooms
+    rooms = Counter(r['rooms'] for r in data if r['rooms'])
+    print(f"\n🛏️  ROOMS")
+    print("-" * 80)
+    for room, count in sorted(rooms.items())[:5]:
+        print(f"{room} otaq:".ljust(20) + f"{count:>6}")
+
+    # Locations
+    locs = Counter(r['location'] for r in data if r['location'])
+    print(f"\n📍 TOP LOCATIONS")
+    print("-" * 80)
+    for loc, count in locs.most_common(10):
+        print(f"{loc[:50]:50} {count:>6}")
+
+    print("\n" + "=" * 80)
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python arenda_scraper.py scrape    # Start scraping")
+        print("  python arenda_scraper.py retry     # Retry failed listings")
+        print("  python arenda_scraper.py stats     # View statistics")
+        sys.exit(1)
+
+    command = sys.argv[1].lower()
+
+    if command == 'scrape':
+        logger.info("Starting scraper...")
+        scraper = ArendaScraper(max_concurrent=5)
+        asyncio.run(scraper.scrape())
+    elif command == 'retry':
+        logger.info("Retrying failed listings...")
+        asyncio.run(retry_failed())
+    elif command == 'stats':
+        show_stats()
+    else:
+        print(f"Unknown command: {command}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
